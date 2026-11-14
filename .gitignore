@@ -1,0 +1,11 @@
+# Rust build output
+target/
+
+# Local secrets
+.env
+
+# Raw benchmark output (published reports live in bench/, raw runs do not)
+bench/raw/
+
+# Logs
+*.log
