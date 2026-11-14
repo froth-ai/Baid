@@ -1,0 +1,15 @@
+/crates/gc-core/        @SanmayAnand @PERSON_B
+/crates/gc-cache/       @SanmayAnand
+/crates/gc-session/     @SanmayAnand
+/crates/gc-predict/     @SanmayAnand
+/crates/gc-exec/        @SanmayAnand
+/crates/gc-invalidate/  @SanmayAnand
+/crates/gc-server/      @SanmayAnand
+/crates/memharness/     @PERSON_B
+/crates/gc-adapters/    @PERSON_B
+/crates/gc-pack/        @PERSON_B
+/crates/gc-telemetry/   @PERSON_B
+/crates/gc-mcp/         @PERSON_B
+/python/                @PERSON_B
+/deploy/                @PERSON_B
+/.github/               @SanmayAnand @PERSON_B
