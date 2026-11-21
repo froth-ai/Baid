@@ -8,6 +8,7 @@ on:
     paths:
       - "crates/adapters/**"
       - "crates/core/**"
+      - "crates/memharness/**"
       - "deploy/**"
       - "Cargo.lock"
       - ".github/workflows/contract.yml"
@@ -35,12 +36,14 @@ jobs:
           docker compose -f deploy/docker-compose.yml exec -T seaweedfs \
             sh -c "echo s3.bucket.create -name baid | weed shell -master=localhost:9333"
 
-      - name: Contract and live adapter tests
+      - name: Contract, live adapter and loader tests
         env:
           BAID_TEST_NEO4J_URL: bolt://127.0.0.1:7687
           BAID_TEST_NEO4J_PASSWORD: baid-dev-password
           BAID_TEST_S3_URL: s3://baid/contract?endpoint=http://127.0.0.1:8333
-        run: cargo test -p adapters --test bolt_fresh_schema --test bolt_live --test contract -- --test-threads=4
+        run: |
+          cargo test -p adapters --test bolt_fresh_schema --test bolt_live --test contract -- --test-threads=4
+          cargo test -p memharness --test live -- --test-threads=1
 
       - name: Service logs
         if: failure()

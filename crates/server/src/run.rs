@@ -1,11 +1,15 @@
 //! Serving both listeners and shutting down cleanly.
 
-use std::future::IntoFuture;
-use std::time::{Duration, Instant};
+use std::future::{Future, IntoFuture};
+use std::panic::AssertUnwindSafe;
+use std::time::Duration;
 
+use futures::FutureExt;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
+
+use crate::failopen::Counters;
 
 use crate::http::{admin_router, public_router};
 use crate::state::AppState;
@@ -25,7 +29,11 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown.clone().cancelled_owned())
         .into_future();
     let chores = async {
-        housekeeping(state, shutdown).await;
+        let counters = state.engine.fail_open();
+        supervise("housekeeping", counters.counters(), &shutdown, || {
+            housekeeping(state.clone(), shutdown.clone())
+        })
+        .await;
         Ok(())
     };
     tokio::try_join!(public_srv, admin_srv, chores)?;
@@ -37,8 +45,46 @@ pub const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
 /// How often housekeeping runs.
 pub const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(60);
 
-/// Expires idle sessions and old idempotency keys, and prunes the invalidation index,
-/// every minute until `shutdown`.
+/// First delay before restarting a background task that panicked; doubles per restart.
+pub const RESTART_BACKOFF_MIN: Duration = Duration::from_secs(1);
+/// Longest delay between restarts.
+pub const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A task that ran this long before panicking restarts at the minimum delay again.
+pub const RESTART_BACKOFF_RESET: Duration = Duration::from_secs(300);
+
+/// Runs a background task, restarting it with backoff whenever it panics, until it returns
+/// or `shutdown` is cancelled. Restarts are counted (`baid_task_restarts_total`). The panic
+/// payload is not logged: it may contain request data.
+pub async fn supervise<F, Fut>(
+    name: &'static str,
+    counters: &Counters,
+    shutdown: &CancellationToken,
+    mut task: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut backoff = RESTART_BACKOFF_MIN;
+    loop {
+        let started = tokio::time::Instant::now();
+        if AssertUnwindSafe(task()).catch_unwind().await.is_ok() {
+            return;
+        }
+        counters.count_task_restart();
+        if started.elapsed() >= RESTART_BACKOFF_RESET {
+            backoff = RESTART_BACKOFF_MIN;
+        }
+        error!(task = name, restart_in = ?backoff, "background task panicked; restarting");
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
+    }
+}
+
+/// Expires idle sessions and old idempotency keys, prunes the invalidation index, and
+/// retries the flush for tenants in cache bypass (G24), every minute until `shutdown`.
 pub async fn housekeeping(state: AppState, shutdown: CancellationToken) {
     let mut tick = tokio::time::interval(HOUSEKEEPING_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -46,7 +92,11 @@ pub async fn housekeeping(state: AppState, shutdown: CancellationToken) {
         tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {
-                let done = state.engine.housekeeping(Instant::now(), SESSION_IDLE);
+                let still_bypassed = state.engine.recover().await;
+                if still_bypassed > 0 {
+                    warn!(tenants = still_bypassed, "tenants still in cache bypass");
+                }
+                let done = state.engine.housekeeping(crate::engine::clock_now(), SESSION_IDLE);
                 if !done.is_empty() {
                     debug!(
                         sessions = done.sessions_expired,

@@ -20,6 +20,11 @@ info:
     - A write can also *add* a result to a search another session already cached; other
       sessions see such additions within the tenant's TTL (default 5 minutes), the same
       bound as writes made outside BAiD.
+    - While the backend is failing (timeout, unavailable, circuit open), a recall may be
+      answered from an entry that expired up to the tenant's `stale_if_error` ago (default
+      30 s, at most 120 s), marked `cache: stale` with its age in `age_ms`. The rules above
+      still hold for such answers, and `max_staleness_ms` still bounds their age; the TTL
+      bound on additions becomes TTL + `stale_if_error` while the backend fails.
 
     **Versioning.** This is API v1. It changes only additively; a breaking change means
     `/v2`. Clients must ignore unknown response fields and handle unknown `cache` values.
@@ -54,10 +59,15 @@ paths:
     get:
       operationId: readyz
       summary: Readiness probe; 503 while shutting down.
+      description: |
+        `ready`, or `degraded` while a backend is failing or BAiD is running without part of
+        its cache; both are 200 because BAiD still serves (possibly stale answers, or errors
+        no worse than the backend's). This unauthenticated probe never names tenants or
+        backends; the admin listener's `/readyz` does.
       security: []
       responses:
         "200":
-          description: Ready for traffic.
+          description: Ready for traffic (possibly degraded).
           content:
             application/json:
               schema:
@@ -256,7 +266,7 @@ components:
       properties:
         status:
           type: string
-          enum: [ok, ready, draining]
+          enum: [ok, ready, degraded, draining]
 
     Error:
       type: object
@@ -340,8 +350,14 @@ components:
           description: Items left out as duplicates or to fit the budget.
         cache:
           type: string
-          enum: [hit, partial, miss]
-          description: Where the items came from. Clients must accept unknown values.
+          enum: [hit, partial, miss, stale]
+          description: |
+            Where the items came from. `stale`: the backend was failing, so an expired (never
+            invalidated) cached answer was served. Clients must accept unknown values.
+        age_ms:
+          type: integer
+          minimum: 0
+          description: Age of the cached answer in ms. Present when `cache` is `hit` or `stale`.
 
     MemoryItem:
       type: object

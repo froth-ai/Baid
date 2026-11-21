@@ -183,6 +183,9 @@ pub enum CacheOutcome {
     Partial,
     /// Everything loaded from the backend.
     Miss,
+    /// The backend failed, so an expired (never invalidated) entry was served within the
+    /// tenant's stale-if-error window (G23).
+    Stale,
 }
 
 impl CacheOutcome {
@@ -192,6 +195,7 @@ impl CacheOutcome {
             CacheOutcome::Hit => "hit",
             CacheOutcome::Partial => "partial",
             CacheOutcome::Miss => "miss",
+            CacheOutcome::Stale => "stale",
         }
     }
 }

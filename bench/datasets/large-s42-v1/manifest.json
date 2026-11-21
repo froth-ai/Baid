@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "generator": 1,
+  "name": "large-s42-v1",
+  "scale": "large",
+  "seed": 42,
+  "tenants": [
+    "large-s42-v1-0",
+    "large-s42-v1-1",
+    "large-s42-v1-2",
+    "large-s42-v1-3",
+    "large-s42-v1-4",
+    "large-s42-v1-5",
+    "large-s42-v1-6",
+    "large-s42-v1-7"
+  ],
+  "memories_per_tenant": 250000,
+  "memories": 2000000,
+  "entities": 788480,
+  "bytes": 526010712,
+  "blake3": "3f98588ec7210fb8a8d98ed679c1f6aaa3b1db43bd30b3e7f6e02c4652ee07e9"
+}

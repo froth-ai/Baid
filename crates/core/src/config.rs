@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::types::{AdapterId, TenantId};
 use crate::units::{ByteSize, HumanDuration};
 
+/// Hard cap on [`TenantConfig::stale_if_error`]: long enough to ride out a breaker cycle or a
+/// backend failover; past it agents should see errors rather than ever older data (G23).
+pub const MAX_STALE_IF_ERROR: Duration = Duration::from_secs(120);
+
 /// The whole service configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -139,7 +143,9 @@ pub struct TenantConfig {
     /// Hard upper bound on how long an entry lives.
     #[serde(default = "defaults::ttl")]
     pub ttl: HumanDuration,
-    /// How long past expiry an entry may still be served when the backend is failing.
+    /// How long past expiry an entry may still be served when the backend is failing
+    /// (stale-if-error, G23). At most `ttl` and at most [`MAX_STALE_IF_ERROR`]; `0s`
+    /// turns it off.
     #[serde(default = "defaults::stale_if_error")]
     pub stale_if_error: HumanDuration,
     /// Tokenizer used for token counts.
@@ -321,9 +327,9 @@ impl Config {
                 "must be between 1s and 24h",
             );
             is.check(
-                t.stale_if_error.get() <= t.ttl.get(),
+                t.stale_if_error.get() <= t.ttl.get().min(MAX_STALE_IF_ERROR),
                 format!("{p}.stale_if_error"),
-                "must not exceed ttl",
+                "must not exceed ttl or 120s",
             );
             is.check(
                 t.backend_timeout.get() >= Duration::from_millis(10)
@@ -508,6 +514,21 @@ adapter_url = "s3://memories"
                 "missing {expected} in {f:?}"
             );
         }
+    }
+
+    #[test]
+    fn stale_if_error_is_capped_by_ttl_and_120s() {
+        let mut c = parse(EXAMPLE);
+        c.tenants[0].ttl = HumanDuration::secs(600);
+        c.tenants[0].stale_if_error = HumanDuration::secs(120);
+        assert!(fields(&c).is_empty(), "120s under a 600s ttl is fine");
+        c.tenants[0].stale_if_error = HumanDuration::secs(121);
+        assert_eq!(fields(&c), ["tenants[acme].stale_if_error"], "over the cap");
+        c.tenants[0].ttl = HumanDuration::secs(60);
+        c.tenants[0].stale_if_error = HumanDuration::secs(61);
+        assert_eq!(fields(&c), ["tenants[acme].stale_if_error"], "over the ttl");
+        c.tenants[0].stale_if_error = HumanDuration::secs(0);
+        assert!(fields(&c).is_empty(), "0 turns it off");
     }
 
     #[test]

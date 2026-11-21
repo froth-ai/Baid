@@ -20,6 +20,7 @@
 //! put for the same key in between. That costs a miss, never a wrong answer.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use baid_core::{
@@ -91,6 +92,24 @@ impl RamStore {
         self.tiers.get(tenant).map(|t| Arc::clone(t.value()))
     }
 
+    /// The entry under `key` if no write invalidated it and it expired less than `grace`
+    /// ago. The write-log check is the same for `get` and `get_stale`: only the TTL bound
+    /// differs.
+    fn current(&self, key: &Key, grace: Duration) -> Option<Arc<CacheEntry>> {
+        let tier = self.tier(key.tenant())?;
+        let entry = Arc::clone(tier.cache.get(key)?.value());
+        if !self.is_current(key.tenant(), &entry) {
+            // Written since it was loaded: never serve it, and free the space.
+            tier.cache.remove(key);
+            return None;
+        }
+        let until = entry
+            .expires_at
+            .checked_add(grace)
+            .unwrap_or(entry.expires_at);
+        (self.clock.now() < until).then_some(entry)
+    }
+
     fn is_current(&self, tenant: &TenantId, entry: &CacheEntry) -> bool {
         self.writes
             .is_current(tenant, entry.entities(), entry.loaded_at)
@@ -144,16 +163,13 @@ impl RamStore {
 #[async_trait]
 impl CacheStore for RamStore {
     async fn get(&self, key: &Key) -> Option<Arc<CacheEntry>> {
-        let tier = self.tier(key.tenant())?;
-        let entry = Arc::clone(tier.cache.get(key)?.value());
-        if !self.is_current(key.tenant(), &entry) {
-            // Written since it was loaded: never serve it, and free the space.
-            tier.cache.remove(key);
-            return None;
-        }
         // Expired entries stay in place (LRU evicts them) so stale-if-error can still
         // reach them; they are just never returned here.
-        (self.clock.now() < entry.expires_at).then_some(entry)
+        self.current(key, Duration::ZERO)
+    }
+
+    async fn get_stale(&self, key: &Key, grace: Duration) -> Option<Arc<CacheEntry>> {
+        self.current(key, grace)
     }
 
     fn contains(&self, key: &Key) -> bool {
@@ -345,6 +361,39 @@ mod tests {
         assert!(f.text(&k).is_some());
         f.clock.advance(Duration::from_secs(1));
         assert_eq!(f.text(&k), None);
+    }
+
+    #[test]
+    fn get_stale_serves_expired_entries_within_the_grace_only() {
+        let f = fixture(&["acme"], 1 << 20);
+        let k = key("acme", "x");
+        let stale = |k: &Key, grace: u64| {
+            block_on(f.store.get_stale(k, Duration::from_secs(grace)))
+                .map(|e| e.items[0].text.to_string())
+        };
+        block_on(f.store.put(k.clone(), f.entry("acme", "x", "hello", false)));
+        assert_eq!(stale(&k, 0).as_deref(), Some("hello"), "fresh is fine");
+        f.clock.advance(Duration::from_secs(60)); // ttl reached
+        assert_eq!(f.text(&k), None, "get refuses it");
+        assert_eq!(stale(&k, 0), None, "no grace, no answer");
+        assert_eq!(stale(&k, 30).as_deref(), Some("hello"), "inside the window");
+        f.clock.advance(Duration::from_secs(30));
+        assert_eq!(stale(&k, 30), None, "the window is exclusive at its end");
+        assert!(f.store.contains(&k), "expired entries are left for LRU");
+    }
+
+    /// Stale-if-error relaxes only the TTL: an entry a write invalidated is never served,
+    /// however wide the window.
+    #[test]
+    fn get_stale_never_serves_invalidated_entries() {
+        let f = fixture(&["acme"], 1 << 20);
+        let k = key("acme", "q");
+        let e1 = f.load("acme", &[], &["acme"], "acme renews in March", false);
+        block_on(f.store.put(k.clone(), e1));
+        f.clock.advance(Duration::from_secs(61));
+        f.store.mark_written(&t("acme"), &[e("acme")]);
+        assert!(block_on(f.store.get_stale(&k, Duration::from_secs(3_600))).is_none());
+        assert!(!f.store.contains(&k), "and the space is freed");
     }
 
     #[test]

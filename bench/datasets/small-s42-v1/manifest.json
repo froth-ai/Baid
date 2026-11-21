@@ -1,0 +1,16 @@
+{
+  "format": 1,
+  "generator": 1,
+  "name": "small-s42-v1",
+  "scale": "small",
+  "seed": 42,
+  "tenants": [
+    "small-s42-v1-0",
+    "small-s42-v1-1"
+  ],
+  "memories_per_tenant": 5000,
+  "memories": 10000,
+  "entities": 3693,
+  "bytes": 2598181,
+  "blake3": "13b104714478f79e7bb4d9850c9cb4187127d5b738a648e3dba56167bd88a4e5"
+}

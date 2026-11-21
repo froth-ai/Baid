@@ -6,6 +6,9 @@ target/
 
 # Raw benchmark output (published reports live in bench/, raw runs do not)
 bench/raw/
+# Datasets are regenerated from their seed; only each manifest.json is committed (G28)
+bench/datasets/*/memories.jsonl
+bench/datasets/*/memories.jsonl.tmp
 
 # Logs
 *.log

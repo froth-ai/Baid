@@ -6,7 +6,7 @@ use std::sync::Arc;
 use baid_core::{AdapterKind, Backend, BackendError, Config, MemoryBackend, TenantId};
 
 use crate::bolt::{BoltBackend, BoltConfig};
-use crate::resilient::Resilient;
+use crate::resilient::{BreakerState, Resilient};
 use crate::s3::{S3Backend, S3Config};
 
 /// Memories an unfiltered S3 search scans (newest first).
@@ -51,10 +51,23 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
+/// Something that can report a circuit breaker's state cheaply (no I/O), for `/readyz`.
+pub trait BreakerProbe: Send + Sync + 'static {
+    /// The breaker's current state.
+    fn breaker_state(&self) -> BreakerState;
+}
+
+impl<B: Backend> BreakerProbe for Resilient<B> {
+    fn breaker_state(&self) -> BreakerState {
+        self.state()
+    }
+}
+
 /// Tenant → backend.
 #[derive(Default)]
 pub struct Registry {
     backends: HashMap<TenantId, Arc<dyn Backend>>,
+    breakers: HashMap<TenantId, Arc<dyn BreakerProbe>>,
 }
 
 impl Registry {
@@ -73,9 +86,12 @@ impl Registry {
         let mut r = Registry::new();
         for t in &config.tenants {
             let deadline = t.backend_timeout.get();
-            let backend: Arc<dyn Backend> = match t.adapter {
+            match t.adapter {
                 AdapterKind::Memory => {
-                    Arc::new(Resilient::with_defaults(MemoryBackend::new(), deadline))
+                    r.insert_resilient(
+                        t.id.clone(),
+                        Arc::new(Resilient::with_defaults(MemoryBackend::new(), deadline)),
+                    );
                 }
                 AdapterKind::Bolt => {
                     let creds = credentials(&t.id);
@@ -91,7 +107,10 @@ impl Registry {
                         tenant: t.id.clone(),
                         source,
                     })?;
-                    Arc::new(Resilient::with_defaults(bolt, deadline))
+                    r.insert_resilient(
+                        t.id.clone(),
+                        Arc::new(Resilient::with_defaults(bolt, deadline)),
+                    );
                 }
                 AdapterKind::S3 => {
                     let creds = credentials(&t.id);
@@ -106,7 +125,10 @@ impl Registry {
                         tenant: t.id.clone(),
                         source,
                     })?;
-                    Arc::new(Resilient::with_defaults(s3, deadline))
+                    r.insert_resilient(
+                        t.id.clone(),
+                        Arc::new(Resilient::with_defaults(s3, deadline)),
+                    );
                 }
                 kind => {
                     return Err(BuildError::Unsupported {
@@ -114,15 +136,32 @@ impl Registry {
                         kind,
                     })
                 }
-            };
-            r.insert(t.id.clone(), backend);
+            }
         }
         Ok(r)
     }
 
-    /// Sets (or replaces) a tenant's backend.
+    /// Sets (or replaces) a tenant's backend. It reports no breaker state.
     pub fn insert(&mut self, tenant: TenantId, backend: Arc<dyn Backend>) {
+        self.breakers.remove(&tenant);
         self.backends.insert(tenant, backend);
+    }
+
+    /// Sets (or replaces) a tenant's backend wrapped in [`Resilient`], so its breaker state
+    /// shows in [`Registry::breaker`].
+    pub fn insert_resilient<B: Backend>(&mut self, tenant: TenantId, backend: Arc<Resilient<B>>) {
+        self.breakers.insert(tenant.clone(), backend.clone());
+        self.backends.insert(tenant, backend);
+    }
+
+    /// The tenant's breaker state, if its backend has one.
+    pub fn breaker(&self, tenant: &TenantId) -> Option<BreakerState> {
+        self.breakers.get(tenant).map(|b| b.breaker_state())
+    }
+
+    /// Every tenant with a backend.
+    pub fn tenants(&self) -> impl Iterator<Item = &TenantId> {
+        self.backends.keys()
     }
 
     /// The tenant's backend.

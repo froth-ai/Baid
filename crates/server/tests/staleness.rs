@@ -19,6 +19,12 @@
 //! The main property runs on a single-threaded runtime with a paused clock: every case is
 //! deterministic and proptest can shrink a failure to a minimal trace. A smaller variant
 //! runs on real threads and real time for genuine parallelism.
+//!
+//! **Outage profile (T17).** The same rules must hold while the backend fails. Here the TTL
+//! is 10 ms and the stale-if-error window 10 ms, so entries expire within a trace, and a
+//! generated schedule makes some backend reads fail. Failed recalls are left out; every
+//! answer that came back, stale ones included, is held to rules 1 and 2, and additionally
+//! (3) a hit is at most the TTL old and a stale answer at most TTL + window old.
 
 #![allow(clippy::unwrap_used)] // test file
 
@@ -29,12 +35,13 @@ use std::time::Duration;
 
 use adapters::Registry;
 use async_trait::async_trait;
+use baid_core::CacheOutcome;
 use baid_core::{
     AdapterId, Backend, BackendError, BackendQuery, BackendResult, Capabilities, Config, EntityId,
     Fact, Filters, Health, MemoryBackend, RecallRequest, SessionId, TenantId, TokenBudget,
     WriteAck,
 };
-use cache::{RamStore, SystemClock, TierConfig};
+use cache::{Clock, RamStore, TierConfig};
 use pack::TruncatingPacker;
 use proptest::prelude::*;
 use server::auth::Tenant;
@@ -44,11 +51,22 @@ use session::Sessions;
 /// Entity names: whole words, so a search for one never matches another.
 const ENTITIES: [&str; 3] = ["alpha", "bravo", "charlie"];
 
+/// The cache's clock: tokio's, so a paused runtime ages entries as the engine sees them.
+struct TokioClock;
+
+impl Clock for TokioClock {
+    fn now(&self) -> std::time::Instant {
+        tokio::time::Instant::now().into_std()
+    }
+}
+
 /// A memory backend that reads at once and replies late, with delays taken in order from a
-/// generated list (so a paused-clock run is reproducible).
+/// generated list (so a paused-clock run is reproducible). Reads fail when the generated
+/// failure schedule says so.
 struct Delayed {
     inner: MemoryBackend,
     delays: Mutex<VecDeque<u8>>,
+    failures: Mutex<VecDeque<bool>>,
 }
 
 impl Delayed {
@@ -72,7 +90,11 @@ impl Backend for Delayed {
         qs: &[BackendQuery],
     ) -> Result<Vec<BackendResult>, BackendError> {
         let answer = self.inner.query_now(t, qs); // data as of now ...
+        let fail = self.failures.lock().unwrap().pop_front().unwrap_or(false);
         tokio::time::sleep(self.next_delay()).await; // ... delivered later
+        if fail {
+            return Err(BackendError::Unavailable("injected outage".into()));
+        }
         Ok(answer)
     }
     async fn write(&self, t: &TenantId, f: &Fact) -> Result<WriteAck, BackendError> {
@@ -101,15 +123,41 @@ struct Step {
 struct Trace {
     sessions: Vec<Vec<Step>>,
     backend_delays: Vec<u8>,
+    /// Which backend reads fail, in call order (empty: none do).
+    failures: Vec<bool>,
 }
 
-fn step() -> impl Strategy<Value = Step> {
+/// Tenant settings for a run.
+#[derive(Clone, Copy, Debug)]
+struct Profile {
+    ttl: Duration,
+    stale_if_error: Duration,
+}
+
+/// T16: entries never expire within a trace; the backend never fails.
+const STEADY: Profile = Profile {
+    ttl: Duration::from_secs(300),
+    stale_if_error: Duration::from_secs(30),
+};
+
+/// T17: entries expire within a trace, and the backend fails on a schedule.
+const OUTAGE: Profile = Profile {
+    ttl: Duration::from_millis(10),
+    stale_if_error: Duration::from_millis(10),
+};
+
+/// One step; `reads_per_write` sets the mix.
+fn step_with(reads_per_write: u32) -> impl Strategy<Value = Step> {
     let act = prop_oneof![
-        (0..ENTITIES.len()).prop_map(|entity| Act::Write { entity }),
-        (0..ENTITIES.len(), any::<bool>())
+        1 => (0..ENTITIES.len()).prop_map(|entity| Act::Write { entity }),
+        reads_per_write => (0..ENTITIES.len(), any::<bool>())
             .prop_map(|(entity, filtered)| Act::Read { entity, filtered }),
     ];
     (act, 0u8..4).prop_map(|(act, pause_ms)| Step { act, pause_ms })
+}
+
+fn step() -> impl Strategy<Value = Step> {
+    step_with(1)
 }
 
 fn trace() -> impl Strategy<Value = Trace> {
@@ -120,6 +168,22 @@ fn trace() -> impl Strategy<Value = Trace> {
         .prop_map(|(sessions, backend_delays)| Trace {
             sessions,
             backend_delays,
+            failures: Vec::new(),
+        })
+}
+
+/// A read-heavy trace (four reads per write, so entries live long enough to expire) with a
+/// backend failure schedule in which about two reads in five fail.
+fn outage_trace() -> impl Strategy<Value = Trace> {
+    (
+        prop::collection::vec(prop::collection::vec(step_with(4), 1..12), 2..5),
+        prop::collection::vec(0u8..6, 0..80),
+        prop::collection::vec(prop::bool::weighted(0.4), 0..80),
+    )
+        .prop_map(|(sessions, backend_delays, failures)| Trace {
+            sessions,
+            backend_delays,
+            failures,
         })
 }
 
@@ -138,12 +202,17 @@ struct ReadRec {
     filtered: bool,
     started_at: u64,
     values: HashSet<u64>,
+    outcome: CacheOutcome,
+    age: Option<Duration>,
 }
 
-fn tenant() -> Tenant {
-    let config: Config = toml::from_str(
-        "[[tenants]]\nid = \"acme\"\napi_key_env = \"K\"\nadapter = \"memory\"\nadapter_url = \"memory://\"\nbackend_timeout = \"30s\"\n",
-    )
+/// The tenant, built without `validate()` so the outage profile may use a sub-second TTL.
+fn tenant(p: Profile) -> Tenant {
+    let config: Config = toml::from_str(&format!(
+        "[[tenants]]\nid = \"acme\"\napi_key_env = \"K\"\nadapter = \"memory\"\nadapter_url = \"memory://\"\nbackend_timeout = \"30s\"\nttl = \"{}ms\"\nstale_if_error = \"{}ms\"\n",
+        p.ttl.as_millis(),
+        p.stale_if_error.as_millis(),
+    ))
     .unwrap();
     Tenant {
         id: config.tenants[0].id.clone(),
@@ -152,13 +221,14 @@ fn tenant() -> Tenant {
 }
 
 /// Runs the trace: sessions concurrently, each one's steps in order.
-async fn run(trace: &Trace) -> (Vec<WriteRec>, Vec<ReadRec>) {
-    let t = tenant();
-    let store = RamStore::new(Arc::new(SystemClock));
+async fn run(trace: &Trace, profile: Profile) -> (Vec<WriteRec>, Vec<ReadRec>) {
+    let t = tenant(profile);
+    let store = RamStore::new(Arc::new(TokioClock));
     store.add_tenant(t.id.clone(), TierConfig::with_capacity(16 << 20));
     let backend = Arc::new(Delayed {
         inner: MemoryBackend::new(),
         delays: Mutex::new(trace.backend_delays.iter().copied().collect()),
+        failures: Mutex::new(trace.failures.iter().copied().collect()),
     });
     let mut reg = Registry::new();
     reg.insert(t.id.clone(), backend);
@@ -215,7 +285,12 @@ async fn run(trace: &Trace) -> (Vec<WriteRec>, Vec<ReadRec>) {
                             filters,
                             max_staleness: None,
                         };
-                        let r = engine.recall(&t, req).await.unwrap();
+                        let r = match engine.recall(&t, req).await {
+                            Ok(r) => r,
+                            // An outage with nothing servable: an error, not an answer.
+                            Err(e) if e.code() == "backend_unavailable" => continue,
+                            Err(e) => panic!("unexpected recall error: {e:?}"),
+                        };
                         let values = r
                             .packed
                             .items
@@ -235,6 +310,8 @@ async fn run(trace: &Trace) -> (Vec<WriteRec>, Vec<ReadRec>) {
                             filtered,
                             started_at,
                             values,
+                            outcome: r.outcome,
+                            age: r.age,
                         });
                     }
                 }
@@ -251,10 +328,30 @@ async fn run(trace: &Trace) -> (Vec<WriteRec>, Vec<ReadRec>) {
     (writes, reads)
 }
 
-/// Every violation of the two rules, as readable messages.
-fn violations(writes: &[WriteRec], reads: &[ReadRec]) -> Vec<String> {
+/// Every violation of the rules, as readable messages. `slack` absorbs the gap between the
+/// cache's and the engine's clock reads on real threads (zero on a paused clock).
+fn violations(
+    writes: &[WriteRec],
+    reads: &[ReadRec],
+    profile: Profile,
+    slack: Duration,
+) -> Vec<String> {
     let mut out = Vec::new();
     for r in reads {
+        let limit = match r.outcome {
+            CacheOutcome::Hit => Some(profile.ttl),
+            CacheOutcome::Stale => Some(profile.ttl + profile.stale_if_error),
+            _ => None,
+        };
+        if let Some(limit) = limit {
+            match r.age {
+                Some(age) if age <= limit + slack => {}
+                age => out.push(format!(
+                    "rule 3: s{} got a {:?} answer aged {age:?}, limit {limit:?}",
+                    r.session, r.outcome
+                )),
+            }
+        }
         for w in writes
             .iter()
             .filter(|w| w.entity == r.entity && w.acked_at < r.started_at)
@@ -287,9 +384,14 @@ fn cases(default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-fn check(trace: &Trace, rt: tokio::runtime::Runtime) -> Result<(), TestCaseError> {
-    let (writes, reads) = rt.block_on(run(trace));
-    let v = violations(&writes, &reads);
+fn check(
+    trace: &Trace,
+    profile: Profile,
+    rt: tokio::runtime::Runtime,
+    slack: Duration,
+) -> Result<(), TestCaseError> {
+    let (writes, reads) = rt.block_on(run(trace, profile));
+    let v = violations(&writes, &reads, profile, slack);
     prop_assert!(v.is_empty(), "{} violation(s):\n{}", v.len(), v.join("\n"));
     Ok(())
 }
@@ -305,8 +407,30 @@ proptest! {
             .start_paused(true)
             .build()
             .unwrap();
-        check(&trace, rt)?;
+        check(&trace, STEADY, rt, Duration::ZERO)?;
     }
+
+    /// The outage profile, deterministic: stale answers obey the same rules.
+    #[test]
+    fn no_stale_reads_during_outages_deterministic(trace in outage_trace()) {
+        check(&trace, OUTAGE, paused(), Duration::ZERO)?;
+    }
+}
+
+fn paused() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap()
+}
+
+fn threaded() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_time()
+        .build()
+        .unwrap()
 }
 
 proptest! {
@@ -315,13 +439,39 @@ proptest! {
     /// Four worker threads, real time: genuine parallelism, at a higher cost per case.
     #[test]
     fn no_stale_reads_parallel(trace in trace()) {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_time()
-            .build()
-            .unwrap();
-        check(&trace, rt)?;
+        check(&trace, STEADY, threaded(), Duration::ZERO)?;
     }
+
+    /// The outage profile on real threads.
+    #[test]
+    fn no_stale_reads_during_outages_parallel(trace in outage_trace()) {
+        check(&trace, OUTAGE, threaded(), Duration::from_millis(20))?;
+    }
+}
+
+/// The outage profile must actually exercise what it claims to: across a fixed set of
+/// generated traces, some answers are stale, some are hits, and some recalls fail.
+#[test]
+fn the_outage_profile_reaches_stale_answers() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let (mut stale, mut hits, mut reads) = (0, 0, 0);
+    for _ in 0..64 {
+        let trace = outage_trace().new_tree(&mut runner).unwrap().current();
+        let (_, rs) = paused().block_on(run(&trace, OUTAGE));
+        reads += rs.len();
+        stale += rs
+            .iter()
+            .filter(|r| r.outcome == CacheOutcome::Stale)
+            .count();
+        hits += rs.iter().filter(|r| r.outcome == CacheOutcome::Hit).count();
+    }
+    eprintln!("outage profile: {reads} answers, {stale} stale, {hits} hits");
+    assert!(
+        stale > 0 && hits > 0,
+        "stale {stale}, hits {hits} of {reads}"
+    );
 }
 
 /// The checker itself must catch a stale read, or the properties above prove nothing.
@@ -339,6 +489,8 @@ fn the_checker_flags_stale_reads() {
         filtered: true,
         started_at: 2,
         values: HashSet::new(),
+        outcome: CacheOutcome::Miss,
+        age: None,
     };
     let stale_own = ReadRec {
         session: 0,
@@ -346,6 +498,8 @@ fn the_checker_flags_stale_reads() {
         filtered: false,
         started_at: 2,
         values: HashSet::new(),
+        outcome: CacheOutcome::Miss,
+        age: None,
     };
     let concurrent = ReadRec {
         session: 1,
@@ -353,6 +507,8 @@ fn the_checker_flags_stale_reads() {
         filtered: true,
         started_at: 1,
         values: HashSet::new(),
+        outcome: CacheOutcome::Miss,
+        age: None,
     };
     let other_unfiltered = ReadRec {
         session: 1,
@@ -360,15 +516,25 @@ fn the_checker_flags_stale_reads() {
         filtered: false,
         started_at: 2,
         values: HashSet::new(),
+        outcome: CacheOutcome::Miss,
+        age: None,
     };
-    assert_eq!(violations(&writes, &[stale_filtered]).len(), 1);
-    assert_eq!(violations(&writes, &[stale_own]).len(), 1);
-    assert!(
-        violations(&writes, &[concurrent]).is_empty(),
-        "read started before the ack"
-    );
-    assert!(
-        violations(&writes, &[other_unfiltered]).is_empty(),
-        "G14 exception"
-    );
+    let v = |r: ReadRec| violations(&writes, &[r], OUTAGE, Duration::ZERO).len();
+    let aged = |outcome, ms| ReadRec {
+        session: 1,
+        entity: 1,
+        filtered: true,
+        started_at: 0,
+        values: HashSet::new(),
+        outcome,
+        age: Some(Duration::from_millis(ms)),
+    };
+    assert_eq!(v(stale_filtered), 1);
+    assert_eq!(v(stale_own), 1);
+    assert_eq!(v(concurrent), 0, "read started before the ack");
+    assert_eq!(v(other_unfiltered), 0, "G14 exception");
+    assert_eq!(v(aged(CacheOutcome::Hit, 10)), 0);
+    assert_eq!(v(aged(CacheOutcome::Hit, 11)), 1, "hit older than the ttl");
+    assert_eq!(v(aged(CacheOutcome::Stale, 20)), 0);
+    assert_eq!(v(aged(CacheOutcome::Stale, 21)), 1, "stale past the window");
 }

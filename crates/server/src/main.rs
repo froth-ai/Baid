@@ -20,6 +20,7 @@ async fn main() -> ExitCode {
             EnvFilter::try_from_env("BAID_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+    server::failopen::install_panic_hook();
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

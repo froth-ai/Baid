@@ -5,6 +5,7 @@
 //! `dyn`. Revisit when that lands on stable Rust.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -74,6 +75,11 @@ pub trait CacheStore: Send + Sync + 'static {
     /// The entry under `key`, if present, unexpired and not invalidated by a write. Does
     /// not check `max_staleness`; see [`CacheEntry::is_fresh`].
     async fn get(&self, key: &Key) -> Option<Arc<CacheEntry>>;
+
+    /// Like [`get`](Self::get), but also returns an entry that expired less than `grace`
+    /// ago. Only the TTL check is relaxed: an entry invalidated by a write is never
+    /// returned. For stale-if-error (G23), when the backend is failing.
+    async fn get_stale(&self, key: &Key, grace: Duration) -> Option<Arc<CacheEntry>>;
 
     /// True if `key` is present. Cheap; used to skip prefetching what is already cached.
     /// May report an entry that `get` would refuse.

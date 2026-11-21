@@ -14,6 +14,6 @@ mod s3;
 
 pub use baid_core::MemoryBackend;
 pub use bolt::{lucene_query, BoltBackend, BoltConfig};
-pub use registry::{BuildError, Credentials, Registry};
+pub use registry::{BreakerProbe, BuildError, Credentials, Registry};
 pub use resilient::{BreakerPolicy, BreakerState, Resilient, RetryPolicy};
 pub use s3::{S3Backend, S3Config};

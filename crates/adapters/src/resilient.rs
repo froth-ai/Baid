@@ -27,7 +27,15 @@
 //! only an outer timeout cut the call short, the future would be dropped, the breaker would
 //! never hear about it, and a dead backend would hold every caller for the full timeout
 //! forever.
+//!
+//! # Panics in the adapter
+//!
+//! A panic inside the wrapped adapter is caught and becomes `Unavailable`: recorded as a
+//! failure, never retried (a panic usually repeats), and counted in [`Resilient::panics`].
+//! Letting it unwind through here would leave a half-open breaker's probe slot claimed,
+//! failing every later call with `CircuitOpen` for good (ADR-009, fail open).
 
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -37,6 +45,7 @@ use baid_core::{
     AdapterId, Backend, BackendError, BackendQuery, BackendResult, Capabilities, Fact, Health,
     TenantId, WriteAck,
 };
+use futures::FutureExt;
 use tokio::time::Instant;
 use tracing::warn;
 
@@ -105,6 +114,7 @@ pub struct Resilient<B> {
     deadline: Duration,
     breaker: Mutex<Breaker>,
     jitter_seed: AtomicU64,
+    panics: AtomicU64,
 }
 
 impl<B: Backend> Resilient<B> {
@@ -121,6 +131,7 @@ impl<B: Backend> Resilient<B> {
                 probe_in_flight: false,
             }),
             jitter_seed: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
+            panics: AtomicU64::new(0),
         }
     }
 
@@ -141,6 +152,11 @@ impl<B: Backend> Resilient<B> {
 
     fn lock(&self) -> MutexGuard<'_, Breaker> {
         self.breaker.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Panics caught in the wrapped adapter since start.
+    pub fn panics(&self) -> u64 {
+        self.panics.load(Ordering::Relaxed)
     }
 
     /// Current breaker state.
@@ -224,9 +240,18 @@ impl<B: Backend> Resilient<B> {
             let result = if remaining.is_zero() {
                 Err(BackendError::Timeout(self.deadline))
             } else {
-                tokio::time::timeout(remaining, f())
-                    .await
-                    .unwrap_or(Err(BackendError::Timeout(self.deadline)))
+                match tokio::time::timeout(remaining, AssertUnwindSafe(f()).catch_unwind()).await {
+                    Err(_) => Err(BackendError::Timeout(self.deadline)),
+                    Ok(Ok(r)) => r,
+                    Ok(Err(_panic)) => {
+                        // The payload is not logged: it may contain request data.
+                        self.panics.fetch_add(1, Ordering::Relaxed);
+                        warn!(id = %self.inner.id(), "adapter panicked; treated as unavailable");
+                        let e = BackendError::Unavailable("adapter panicked".into());
+                        self.on_failure(&e);
+                        return Err(e);
+                    }
+                }
             };
             let remaining = self.deadline.saturating_sub(start.elapsed());
             match result {
@@ -464,6 +489,74 @@ mod tests {
             before.elapsed() < Duration::from_millis(1),
             "open breaker fails fast"
         );
+    }
+
+    /// Panics on its first `n` reads, then answers.
+    struct Panicky {
+        left: std::sync::atomic::AtomicU32,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl Backend for Panicky {
+        fn id(&self) -> AdapterId {
+            AdapterId::new("panicky").unwrap()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        async fn query_batch(
+            &self,
+            _: &TenantId,
+            qs: &[BackendQuery],
+        ) -> Result<Vec<BackendResult>, BackendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let left = self.left.load(Ordering::SeqCst);
+            if left > 0 {
+                self.left.store(left - 1, Ordering::SeqCst);
+                panic!("adapter bug");
+            }
+            Ok(qs.iter().map(|_| BackendResult::default()).collect())
+        }
+        async fn write(&self, _: &TenantId, _: &Fact) -> Result<WriteAck, BackendError> {
+            panic!("adapter bug");
+        }
+        async fn health(&self) -> Health {
+            Health::Up
+        }
+    }
+
+    /// A panicking half-open probe must reopen the breaker, not leave the probe slot
+    /// claimed forever.
+    #[tokio::test(start_paused = true)]
+    async fn adapter_panics_are_failures_not_crashes() {
+        let r = Resilient::new(
+            Panicky {
+                left: 2.into(),
+                calls: 0.into(),
+            },
+            RetryPolicy::default(),
+            BreakerPolicy {
+                failure_threshold: 1,
+                open_for: Duration::from_secs(10),
+            },
+            Duration::from_secs(2),
+        );
+        let e = r.query_batch(&t(), &q()).await.unwrap_err();
+        assert!(matches!(e, BackendError::Unavailable(_)), "{e:?}");
+        assert_eq!(r.inner().calls.load(Ordering::SeqCst), 1, "not retried");
+        assert_eq!((r.state(), r.panics()), (BreakerState::Open, 1));
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(r.query_batch(&t(), &q()).await.is_err(), "probe panics");
+        assert_eq!(r.state(), BreakerState::Open, "probe failure reopens");
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(
+            r.query_batch(&t(), &q()).await.is_ok(),
+            "next probe allowed"
+        );
+        assert_eq!(r.state(), BreakerState::Closed);
+        let e = r.write(&t(), &fact(None)).await.unwrap_err();
+        assert!(matches!(e, BackendError::Unavailable(_)), "writes too");
     }
 
     #[test]

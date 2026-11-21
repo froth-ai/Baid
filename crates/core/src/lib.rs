@@ -20,7 +20,7 @@ pub mod mock;
 pub use backend::{BackendResult, Capabilities, Fact, Health, WriteAck};
 pub use config::{
     AdapterKind, CacheConfig, Config, ConfigError, ConfigIssue, PrefetchConfig, ServerConfig,
-    TelemetryConfig, TenantConfig,
+    TelemetryConfig, TenantConfig, MAX_STALE_IF_ERROR,
 };
 pub use error::{BackendError, IdError, RequestError, TokenBudgetError};
 pub use item::{

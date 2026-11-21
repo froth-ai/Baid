@@ -50,8 +50,11 @@ pub struct RecallResponse {
     pub tokens: u32,
     /// Items dropped as duplicates or to fit the budget.
     pub dropped: u32,
-    /// `hit` or `miss`.
+    /// `hit`, `miss` or `stale` (backend failing, expired entry served; G23).
     pub cache: &'static str,
+    /// Age of the cached entry served, in ms: present for `hit` and `stale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
 }
 
 /// `POST /v1/remember`
@@ -122,6 +125,9 @@ pub async fn recall(
         tokens: r.packed.tokens,
         dropped: r.packed.dropped,
         cache: r.outcome.as_str(),
+        age_ms: r
+            .age
+            .map(|a| u64::try_from(a.as_millis()).unwrap_or(u64::MAX)),
     }))
 }
 

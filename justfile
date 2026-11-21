@@ -47,10 +47,13 @@ logs *service:
 # Integration tests against the local stack (needs `just up`)
 test-live $BAID_TEST_NEO4J_URL="bolt://127.0.0.1:7687" $BAID_TEST_NEO4J_PASSWORD="baid-dev-password" $BAID_TEST_S3_URL="s3://baid/contract?endpoint=http://127.0.0.1:8333":
     cargo test -p adapters --test bolt_fresh_schema --test bolt_live --test contract -- --test-threads=4
+    cargo test -p memharness --test live -- --test-threads=1
 
-# Load a synthetic dataset into the local stack
-load:
-    @echo "not set up yet (see docs/build-plan.md)"
+# Generate a synthetic dataset and load it into the local stack's Neo4j and S3 (needs `just up`;
+# BAiD must be stopped: loading bypasses its write log). `just load medium 7`
+load scale="small" seed="42" $BAID_LOAD_NEO4J_URL="bolt://127.0.0.1:7687" $BAID_LOAD_NEO4J_PASSWORD="baid-dev-password" $BAID_LOAD_S3_URL="s3://baid/bench?endpoint=http://127.0.0.1:8333" $BAID_LOAD_S3_KEY="baid" $BAID_LOAD_S3_SECRET="baid-dev-password":
+    cargo run --release -p memharness -- datagen --scale {{scale}} --seed {{seed}}
+    cargo run --release -p memharness -- load --scale {{scale}} --seed {{seed}} --target bolt --target s3 --verify
 
 # Run the memharness benchmark
 bench:

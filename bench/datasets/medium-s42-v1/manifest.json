@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "generator": 1,
+  "name": "medium-s42-v1",
+  "scale": "medium",
+  "seed": 42,
+  "tenants": [
+    "medium-s42-v1-0",
+    "medium-s42-v1-1",
+    "medium-s42-v1-2",
+    "medium-s42-v1-3"
+  ],
+  "memories_per_tenant": 50000,
+  "memories": 200000,
+  "entities": 76674,
+  "bytes": 52511735,
+  "blake3": "dfa206bef24624a156a334cac12dfc5ea01d7a364fead272f7cad75b3bf18f58"
+}

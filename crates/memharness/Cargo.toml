@@ -6,9 +6,29 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "memharness"
 path = "src/main.rs"
+
+[dependencies]
+adapters.workspace = true
+anyhow.workspace = true
+baid-core.workspace = true
+blake3.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+futures.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+time = { workspace = true, features = ["serde", "formatting", "parsing"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+
+[dev-dependencies]
+object_store.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

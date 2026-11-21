@@ -29,12 +29,13 @@ baid-core.workspace = true
 blake3.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 figment = { workspace = true, features = ["toml", "env"] }
+futures.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 tokio-util.workspace = true
-tower-http = { workspace = true, features = ["trace"] }
+tower-http = { workspace = true, features = ["trace", "catch-panic"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
